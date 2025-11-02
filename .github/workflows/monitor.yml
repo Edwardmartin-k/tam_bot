@@ -1,4 +1,4 @@
-vname: Check Bot Status
+name: Check Bot Status
 
 on:
   schedule:
@@ -16,9 +16,12 @@ jobs:
         run: |
           # Make a request to the bot's URL and store the HTTP status code
           # The "|| true" part prevents the workflow from failing if it gets a 503 error
+          
+          # !!! IMPORTANT: Replace this URL with your bot's actual Render URL !!!
           STATUS_CODE=$(curl -o /dev/null -s -w "%{http_code}" "https://koyeb-bot-22.onrender.com" || true)
+          
           echo "HTTP Status Code: $STATUS_CODE"
-          echo "::set-output name=status::$STATUS_CODE"
+          echo "status=$STATUS_CODE" >> $GITHUB_OUTPUT
           
       - name: Redeploy if the bot is down
         # This step only runs if the previous step's output (the status code) was 503
@@ -33,3 +36,4 @@ jobs:
         if: steps.check_bot.outputs.status != '503'
         run: |
           echo "Bot is up and running. Status: ${{ steps.check_bot.outputs.status }}"
+
