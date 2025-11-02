@@ -1,0 +1,35 @@
+vname: Check Bot Status
+
+on:
+  schedule:
+    # Runs this check every 15 minutes
+    - cron: '*/15 * * * *'
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  check-status:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the bot's web service status
+        id: check_bot
+        run: |
+          # Make a request to the bot's URL and store the HTTP status code
+          # The "|| true" part prevents the workflow from failing if it gets a 503 error
+          STATUS_CODE=$(curl -o /dev/null -s -w "%{http_code}" "https://koyeb-bot-22.onrender.com" || true)
+          echo "HTTP Status Code: $STATUS_CODE"
+          echo "::set-output name=status::$STATUS_CODE"
+          
+      - name: Redeploy if the bot is down
+        # This step only runs if the previous step's output (the status code) was 503
+        if: steps.check_bot.outputs.status == '503'
+        run: |
+          echo "Bot is down (503)! Triggering redeploy..."
+          # Securely calls the Render Deploy Hook URL you stored in secrets
+          curl "${{ secrets.RENDER_DEPLOY_HOOK }}"
+          
+      - name: Report all clear
+        # This step only runs if the status was NOT 503
+        if: steps.check_bot.outputs.status != '503'
+        run: |
+          echo "Bot is up and running. Status: ${{ steps.check_bot.outputs.status }}"
