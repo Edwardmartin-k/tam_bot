@@ -25,9 +25,16 @@ user_usage = {}
 
 # --- File Storage ---
 # Using non-sequential, randomized keys to prevent users from guessing the next part.
-# The deeplink you share will now use these secure keys.
 FILES = {
-   
+    "hang_edhy_part1": {
+        "file_ids": ["BQACAgQAAxkBAAMWak9-9Hw3VdIQJB6ZlIMhdlbRH54AApEKAAK23MBS_KA1G4RBLeU8BA"]
+    },
+    "hang_xyce_part2": {
+        "file_ids": ["BQACAgQAAxkBAAMXak9-9DSZ5X32pqVfoG3WQQrcNbgAAoIKAALMN8FSQODqpuotfmQ8BA"]
+    },
+    "hang_bhgto_part3": {
+        "file_ids": ["BQACAgQAAxkBAAMYak9-9BTEsK2xKninQ8yQ20FBciMAAuALAAI4gcBSKbufS5qaVr48BA"]
+    }
 }
 
 
