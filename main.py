@@ -4,6 +4,7 @@ import schedule
 import time
 import threading
 import secrets
+import requests
 from pymongo import MongoClient
 from keep_alive import keep_alive
 
@@ -11,6 +12,7 @@ from keep_alive import keep_alive
 API_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 ADMIN_USER_ID_STR = os.environ.get('ADMIN_USER_ID')
 MONGO_URI = os.environ.get('MONGO_URI')
+VPLINK_API_KEY = os.environ.get('VPLINK_API_KEY')
 
 # Check secrets
 if not all([API_TOKEN, ADMIN_USER_ID_STR, MONGO_URI]):
@@ -30,8 +32,34 @@ bot = telebot.TeleBot(API_TOKEN)
 BOT_INFO = bot.get_me()
 BOT_USERNAME = BOT_INFO.username
 
-# This dictionary tracks users who have already received a file.
+# Track users who received a file
 user_usage = {}
+
+
+# --- Helper: URL Shortener Function ---
+
+def get_short_url(long_url):
+    """Calls VPLINK API to shorten the link."""
+    if not VPLINK_API_KEY:
+        return long_url
+
+    endpoint = "https://vplink.in/api"
+    params = {
+        "api": VPLINK_API_KEY,
+        "url": long_url
+    }
+    try:
+        response = requests.get(endpoint, params=params, timeout=10)
+        data = response.json()
+        # VPLINK returns {"status": "success", "shortenedUrl": "https://vplink.in/..."}
+        if data.get("status") == "success" and "shortenedUrl" in data:
+            return data["shortenedUrl"]
+        elif "shortenedUrl" in data:
+            return data["shortenedUrl"]
+    except Exception as e:
+        print(f"Error while calling VPLINK API: {e}")
+    
+    return long_url
 
 
 # --- Auto-Delete and Daily Reset Schedulers ---
@@ -128,7 +156,7 @@ def send_files_and_finalize(message, file_record):
 
 @bot.message_handler(content_types=['document', 'video', 'audio'])
 def handle_admin_upload(message):
-    """Admin-only function: Automatically stores the file in MongoDB and creates a deeplink."""
+    """Admin-only: Stores file in MongoDB, calls VPLINK API, and returns ready post."""
     if message.from_user.id != ADMIN_USER_ID or message.chat.type != 'private':
         return
 
@@ -143,11 +171,11 @@ def handle_admin_upload(message):
     if not file_id:
         return
 
-    # Generate a random 7-character key (e.g., 'aX9_zQ1')
+    # Generate random key
     file_key = secrets.token_urlsafe(5)
 
-    # Title from caption (or fallback)
-    title = message.caption if message.caption else "Movie/Episode"
+    # Title from caption or fallback
+    title = message.caption if message.caption else "Movie / Series Download"
 
     # Save to MongoDB
     files_col.insert_one({
@@ -157,14 +185,27 @@ def handle_admin_upload(message):
         "created_at": time.time()
     })
 
+    # Generate Telegram deep link
     deeplink = f"https://t.me/{BOT_USERNAME}?start={file_key}"
 
+    # Auto-shorten with VPLINK
+    short_url = get_short_url(deeplink)
+
+    # Formatted post template ready to copy or forward to channels
+    post_template = (
+        f"🎬 **{title}**\n\n"
+        f"⚡ **Direct Download Link:**\n"
+        f"{short_url}\n\n"
+        f"🍿 _Files auto-delete after 10 mins. Forward to Saved Messages!_"
+    )
+
     reply_text = (
-        f"✅ **Saved to Database!**\n\n"
-        f"🎬 **Title:** `{title}`\n"
+        f"✅ **Saved & Shortened!**\n\n"
         f"🔑 **Key:** `{file_key}`\n"
-        f"🔗 **Deep Link:**\n`{deeplink}`\n\n"
-        f"👉 Copy this link and paste it into your URL shortener!"
+        f"🔗 **Short URL:** `{short_url}`\n\n"
+        f"📋 **Ready Channel Post (Forward / Copy):**\n"
+        f"───────────────\n"
+        f"{post_template}"
     )
     bot.reply_to(message, reply_text, parse_mode="Markdown")
 
@@ -172,7 +213,7 @@ def handle_admin_upload(message):
 # --- Main Bot Execution ---
 if __name__ == "__main__":
     print("🤖 Bot is starting...")
-    keep_alive()  # Starts the Flask web server in a thread
+    keep_alive()
     scheduler_thread = threading.Thread(target=run_scheduler)
     scheduler_thread.daemon = True
     scheduler_thread.start()
