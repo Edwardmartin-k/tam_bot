@@ -3,39 +3,35 @@ import os
 import schedule
 import time
 import threading
+import secrets
+from pymongo import MongoClient
 from keep_alive import keep_alive
 
 # --- Configuration ---
 API_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 ADMIN_USER_ID_STR = os.environ.get('ADMIN_USER_ID')
+MONGO_URI = os.environ.get('MONGO_URI')
 
-# A check to ensure secrets are set on Render
-if not all([API_TOKEN, ADMIN_USER_ID_STR]):
-    raise ValueError("FATAL ERROR: Both TELEGRAM_BOT_TOKEN and ADMIN_USER_ID must be set in Render's Environment Variables.")
+# Check secrets
+if not all([API_TOKEN, ADMIN_USER_ID_STR, MONGO_URI]):
+    raise ValueError("FATAL ERROR: TELEGRAM_BOT_TOKEN, ADMIN_USER_ID, and MONGO_URI must be set in Render's Environment Variables.")
 
 try:
     ADMIN_USER_ID = int(ADMIN_USER_ID_STR)
 except ValueError:
     raise ValueError("FATAL ERROR: ADMIN_USER_ID must be a valid integer.")
 
+# --- Database Setup ---
+mongo_client = MongoClient(MONGO_URI)
+db = mongo_client["movie_delivery"]
+files_col = db["files"]
+
 bot = telebot.TeleBot(API_TOKEN)
+BOT_INFO = bot.get_me()
+BOT_USERNAME = BOT_INFO.username
 
 # This dictionary tracks users who have already received a file.
 user_usage = {}
-
-# --- File Storage ---
-# Using non-sequential, randomized keys to prevent users from guessing the next part.
-FILES = {
-    "hang_edhy_part1": {
-        "file_ids": ["BQACAgQAAxkBAAMWak9-9Hw3VdIQJB6ZlIMhdlbRH54AApEKAAK23MBS_KA1G4RBLeU8BA"]
-    },
-    "hang_xyce_part2": {
-        "file_ids": ["BQACAgQAAxkBAAMXak9-9DSZ5X32pqVfoG3WQQrcNbgAAoIKAALMN8FSQODqpuotfmQ8BA"]
-    },
-    "hang_bhgto_part3": {
-        "file_ids": ["BQACAgQAAxkBAAMYak9-9BTEsK2xKninQ8yQ20FBciMAAuALAAI4gcBSKbufS5qaVr48BA"]
-    }
-}
 
 
 # --- Auto-Delete and Daily Reset Schedulers ---
@@ -78,7 +74,10 @@ def handle_start(message):
 
     file_key = args[1]
 
-    if file_key not in FILES:
+    # Search directly from MongoDB
+    file_record = files_col.find_one({"file_key": file_key})
+
+    if not file_record:
         bot.reply_to(message, "❌ Invalid or expired file link.")
         return
 
@@ -86,27 +85,26 @@ def handle_start(message):
         bot.reply_to(message, "❌ You have already claimed your one file for this session.")
         return
 
-    send_files_and_finalize(message, file_key)
+    send_files_and_finalize(message, file_record)
 
 
-def send_files_and_finalize(message, file_key):
+def send_files_and_finalize(message, file_record):
     """Sends one or more files, adds warnings, and schedules deletion for each."""
     user_id = message.from_user.id
     chat_id = message.chat.id
 
-    if user_id in user_usage: # Final check
+    if user_id in user_usage:
         return
 
     try:
-        file_id_list = FILES[file_key].get('file_ids', [])
+        file_id_list = file_record.get('file_ids', [])
         if not file_id_list:
-            raise ValueError("No file_ids found for this key.")
+            raise ValueError("No file_ids found for this record.")
 
         bot.send_message(chat_id, f"📂 Preparing your request... You will receive {len(file_id_list)} file(s).")
-        time.sleep(2) # Small delay for a better user experience
+        time.sleep(2)
 
         for i, file_id in enumerate(file_id_list):
-            # --- Warning Message ---
             caption_text = (
                 f"📎 File {i+1} of {len(file_id_list)}\n\n"
                 f"⚠️ **Note:** This File/Video will be deleted in 10 mins ❌ (Due to Copyright Issues).\n\n"
@@ -115,39 +113,69 @@ def send_files_and_finalize(message, file_key):
 
             sent_message = bot.send_document(chat_id, file_id, caption=caption_text, parse_mode="Markdown")
 
-            # --- Schedule Deletion for each file ---
+            # Schedule Deletion
             deletion_thread = threading.Thread(target=schedule_message_deletion, args=(chat_id, sent_message.message_id))
             deletion_thread.start()
-            time.sleep(1) # Prevents Telegram from rate-limiting the bot
+            time.sleep(1)
 
         user_usage[user_id] = True
         bot.send_message(chat_id, "✅ All files have been sent. Access is now complete.")
 
     except Exception as e:
-        print(f"Error in send_files_and_finalize for key {file_key}: {e}")
+        print(f"Error in send_files_and_finalize: {e}")
         bot.send_message(chat_id, "❌ An error occurred while sending the files.")
 
 
 @bot.message_handler(content_types=['document', 'video', 'audio'])
-def get_file_id(message):
-    """Admin-only function to get file IDs."""
-    if message.from_user.id == ADMIN_USER_ID and message.chat.type == 'private':
-        file_id = ""
-        if message.document: file_id = message.document.file_id
-        elif message.video: file_id = message.video.file_id
-        elif message.audio: file_id = message.audio.file_id
-        reply_text = f"New File ID Found!\n\n**ID:** `{file_id}`"
-        bot.reply_to(message, reply_text, parse_mode="Markdown")
+def handle_admin_upload(message):
+    """Admin-only function: Automatically stores the file in MongoDB and creates a deeplink."""
+    if message.from_user.id != ADMIN_USER_ID or message.chat.type != 'private':
+        return
+
+    file_id = ""
+    if message.document:
+        file_id = message.document.file_id
+    elif message.video:
+        file_id = message.video.file_id
+    elif message.audio:
+        file_id = message.audio.file_id
+
+    if not file_id:
+        return
+
+    # Generate a random 7-character key (e.g., 'aX9_zQ1')
+    file_key = secrets.token_urlsafe(5)
+
+    # Title from caption (or fallback)
+    title = message.caption if message.caption else "Movie/Episode"
+
+    # Save to MongoDB
+    files_col.insert_one({
+        "file_key": file_key,
+        "title": title,
+        "file_ids": [file_id],
+        "created_at": time.time()
+    })
+
+    deeplink = f"https://t.me/{BOT_USERNAME}?start={file_key}"
+
+    reply_text = (
+        f"✅ **Saved to Database!**\n\n"
+        f"🎬 **Title:** `{title}`\n"
+        f"🔑 **Key:** `{file_key}`\n"
+        f"🔗 **Deep Link:**\n`{deeplink}`\n\n"
+        f"👉 Copy this link and paste it into your URL shortener!"
+    )
+    bot.reply_to(message, reply_text, parse_mode="Markdown")
 
 
 # --- Main Bot Execution ---
 if __name__ == "__main__":
     print("🤖 Bot is starting...")
-    keep_alive() # Starts the Flask web server in a thread
+    keep_alive()  # Starts the Flask web server in a thread
     scheduler_thread = threading.Thread(target=run_scheduler)
     scheduler_thread.daemon = True
     scheduler_thread.start()
     print("✔️ Daily reset scheduler started.")
     print("✔️ Bot is now polling for messages.")
     bot.infinity_polling(timeout=10, long_polling_timeout=5)
-
