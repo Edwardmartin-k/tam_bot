@@ -34,9 +34,10 @@ mongo_client = MongoClient(MONGO_URI)
 db = mongo_client["movie_delivery"]
 files_col = db["files"]
 
-# Track daily user claims and ongoing admin batch sessions
+# Track daily user claims and active batch sessions per admin
 user_usage = {}
 admin_batches = {}  # { admin_id: { "title": "...", "file_ids": [] } }
+batch_lock = threading.Lock()
 
 
 # --- Helper: URL Shortener Function ---
@@ -64,7 +65,7 @@ def get_short_url(long_url):
 
 def schedule_message_deletion(bot_instance, chat_id, message_id):
     """Waits 10 minutes and deletes the media file."""
-    time.sleep(600)  # 10 minutes
+    time.sleep(600)  # 10 minutes = 600 seconds
     try:
         bot_instance.delete_message(chat_id, message_id)
         print(f"Deleted message {message_id} from {chat_id}")
@@ -112,7 +113,6 @@ def setup_bot_handlers(bot):
             bot.reply_to(message, "❌ You have already claimed your file for this session.")
             return
 
-        # Deliver file pack
         file_id_list = file_record.get('file_ids', [])
         if not file_id_list:
             bot.reply_to(message, "❌ File records not found.")
@@ -124,55 +124,64 @@ def setup_bot_handlers(bot):
         for i, file_id in enumerate(file_id_list):
             caption_text = (
                 f"📎 File {i+1} of {len(file_id_list)}\n\n"
-                f"⚠️ **Note:** This File/Video will be deleted in 10 mins ❌ (Copyright Protection).\n\n"
-                f"Please forward this to your **Saved Messages** to save it permanently!"
+                f"⚠️ Note: This file will be deleted in 10 mins (Copyright Protection).\n\n"
+                f"Please forward this to your Saved Messages to keep it permanently!"
             )
-            sent_msg = bot.send_document(message.chat.id, file_id, caption=caption_text, parse_mode="Markdown")
-
-            # Start 10-min deletion timer
-            del_thread = threading.Thread(target=schedule_message_deletion, args=(bot, message.chat.id, sent_msg.message_id))
-            del_thread.start()
+            try:
+                sent_msg = bot.send_document(message.chat.id, file_id, caption=caption_text)
+                del_thread = threading.Thread(
+                    target=schedule_message_deletion,
+                    args=(bot, message.chat.id, sent_msg.message_id),
+                    daemon=True
+                )
+                del_thread.start()
+            except Exception as e:
+                print(f"Error sending document: {e}")
             time.sleep(1)
 
         user_usage[user_id] = True
         bot.send_message(message.chat.id, "✅ All files sent. Access complete.")
 
-    # 2. Batching: Start a series pack
-    @bot.message_handler(commands=['batch'])
+    # 2. Batching: Start a series pack (Accepts BOTH /batch and /newbatch)
+    @bot.message_handler(commands=['batch', 'newbatch'])
     def start_batch(message):
         if message.from_user.id != ADMIN_USER_ID or message.chat.type != 'private':
             return
+
         args = message.text.split(maxsplit=1)
-        batch_title = args[1] if len(args) > 1 else "Series Pack"
-        
-        admin_batches[message.from_user.id] = {
-            "title": batch_title,
-            "file_ids": []
-        }
-        bot.reply_to(
-            message,
-            f"📦 **Started Batch:** `{batch_title}`\n\n"
-            "Now upload or forward all episodes for this part (e.g., Ep 1, Ep 2, Ep 3).\n"
-            "When done, send `/done` to generate the pack link.",
-            parse_mode="Markdown"
+        batch_title = args[1].strip() if len(args) > 1 else "Series Pack"
+
+        with batch_lock:
+            admin_batches[message.from_user.id] = {
+                "title": batch_title,
+                "file_ids": []
+            }
+
+        reply_msg = (
+            f"📦 Started Batch: {batch_title}\n\n"
+            "Now upload or forward all episodes for this pack.\n"
+            "When done, send /done to generate the combined link."
         )
+        bot.reply_to(message, reply_msg)
 
     # 3. Batching: Finalize pack
     @bot.message_handler(commands=['done'])
     def finalize_batch(message):
         if message.from_user.id != ADMIN_USER_ID or message.chat.type != 'private':
             return
-        
-        session = admin_batches.get(message.from_user.id)
-        if not session or not session["file_ids"]:
-            bot.reply_to(message, "❌ No files collected. Upload episodes first or send `/newbatch <title>`.")
-            return
+
+        with batch_lock:
+            session = admin_batches.get(message.from_user.id)
+            if not session or not session.get("file_ids"):
+                bot.reply_to(message, "❌ No files collected. Upload episodes first or send /batch <title>.")
+                return
+
+            file_ids = list(session["file_ids"])
+            title = session["title"]
+            del admin_batches[message.from_user.id]
 
         file_key = secrets.token_urlsafe(5)
-        title = session["title"]
-        file_ids = session["file_ids"]
 
-        # Save multi-file pack into MongoDB
         files_col.insert_one({
             "file_key": file_key,
             "title": title,
@@ -180,54 +189,55 @@ def setup_bot_handlers(bot):
             "created_at": time.time()
         })
 
-        del admin_batches[message.from_user.id]
-
         deeplink = f"https://t.me/{bot_username}?start={file_key}"
         short_url = get_short_url(deeplink)
 
         post_template = (
-            f"🎬 **{title}**\n\n"
-            f"📦 **Bundle:** {len(file_ids)} Episodes\n"
-            f"⚡ **Direct Download Link:**\n"
+            f"🎬 {title}\n\n"
+            f"📦 Bundle: {len(file_ids)} Episodes\n"
+            f"⚡ Direct Download Link:\n"
             f"{short_url}\n\n"
-            f"🍿 _Files auto-delete after 10 mins. Forward to Saved Messages!_"
+            f"🍿 Files auto-delete after 10 mins. Forward to Saved Messages!"
         )
 
-        bot.reply_to(
-            message,
-            f"✅ **Batch Completed ({len(file_ids)} files linked)!**\n\n"
-            f"🔑 **Key:** `{file_key}`\n"
-            f"🔗 **Short URL:** `{short_url}`\n\n"
-            f"📋 **Channel Post:**\n"
+        reply_text = (
+            f"✅ Batch Completed ({len(file_ids)} files linked)!\n\n"
+            f"🔑 Key: {file_key}\n"
+            f"🔗 Short URL: {short_url}\n\n"
+            f"📋 Channel Post:\n"
             f"───────────────\n"
-            f"{post_template}",
-            parse_mode="Markdown"
+            f"{post_template}"
         )
+        bot.reply_to(message, reply_text)
 
-    # 4. Single-Upload Handler (Single Movie or Ongoing Batch item)
+    # 4. Upload Handler (Single File or Episode inside Batch)
     @bot.message_handler(content_types=['document', 'video', 'audio'])
     def handle_upload(message):
         if message.from_user.id != ADMIN_USER_ID or message.chat.type != 'private':
             return
 
         file_id = ""
-        if message.document: file_id = message.document.file_id
-        elif message.video: file_id = message.video.file_id
-        elif message.audio: file_id = message.audio.file_id
+        if message.document:
+            file_id = message.document.file_id
+        elif message.video:
+            file_id = message.video.file_id
+        elif message.audio:
+            file_id = message.audio.file_id
 
         if not file_id:
             return
 
-        # Case A: If admin is actively uploading to an episode batch
-        if message.from_user.id in admin_batches:
-            admin_batches[message.from_user.id]["file_ids"].append(file_id)
-            count = len(admin_batches[message.from_user.id]["file_ids"])
-            bot.reply_to(message, f"➕ Added Episode {count} to batch. Upload next or send `/done`.")
-            return
+        # Check if an active batch exists for this admin
+        with batch_lock:
+            if message.from_user.id in admin_batches:
+                admin_batches[message.from_user.id]["file_ids"].append(file_id)
+                count = len(admin_batches[message.from_user.id]["file_ids"])
+                bot.reply_to(message, f"➕ Added Episode {count} to batch. Upload next or send /done.")
+                return
 
-        # Case B: Standard Single Movie Upload
+        # Otherwise, process single upload
         file_key = secrets.token_urlsafe(5)
-        title = message.caption if message.caption else "Movie Download"
+        title = message.caption.strip() if message.caption else "Movie Download"
 
         files_col.insert_one({
             "file_key": file_key,
@@ -240,21 +250,21 @@ def setup_bot_handlers(bot):
         short_url = get_short_url(deeplink)
 
         post_template = (
-            f"🎬 **{title}**\n\n"
-            f"⚡ **Direct Download Link:**\n"
+            f"🎬 {title}\n\n"
+            f"⚡ Direct Download Link:\n"
             f"{short_url}\n\n"
-            f"🍿 _Files auto-delete after 10 mins. Forward to Saved Messages!_"
+            f"🍿 Files auto-delete after 10 mins. Forward to Saved Messages!"
         )
 
         reply_text = (
-            f"✅ **Saved & Shortened!**\n\n"
-            f"🔑 **Key:** `{file_key}`\n"
-            f"🔗 **Short URL:** `{short_url}`\n\n"
-            f"📋 **Channel Post:**\n"
+            f"✅ Saved & Shortened!\n\n"
+            f"🔑 Key: {file_key}\n"
+            f"🔗 Short URL: {short_url}\n\n"
+            f"📋 Channel Post:\n"
             f"───────────────\n"
             f"{post_template}"
         )
-        bot.reply_to(message, reply_text, parse_mode="Markdown")
+        bot.reply_to(message, reply_text)
 
 
 # --- Multi-Bot Worker Runner ---
@@ -262,7 +272,8 @@ def setup_bot_handlers(bot):
 def start_bot_thread(token):
     bot = telebot.TeleBot(token)
     setup_bot_handlers(bot)
-    print(f"🤖 Bot @{bot.get_me().username} started polling...")
+    username = bot.get_me().username
+    print(f"🤖 Bot @{username} started polling...")
     bot.infinity_polling(timeout=10, long_polling_timeout=5)
 
 
@@ -270,11 +281,9 @@ if __name__ == "__main__":
     print("🚀 Initializing Master Multi-Bot Service...")
     keep_alive()
 
-    # Background scheduler thread
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
     scheduler_thread.start()
 
-    # Launch each bot concurrently in its own daemon thread
     bot_threads = []
     for token in valid_tokens:
         t = threading.Thread(target=start_bot_thread, args=(token,), daemon=True)
@@ -283,6 +292,5 @@ if __name__ == "__main__":
 
     print(f"✔️ Active bots running: {len(valid_tokens)}")
 
-    # Keep the main process alive
     while True:
         time.sleep(10)
