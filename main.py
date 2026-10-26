@@ -138,7 +138,7 @@ def setup_bot_handlers(bot):
         bot.send_message(message.chat.id, "✅ All files sent. Access complete.")
 
     # 2. Batching: Start a series pack
-    @bot.message_handler(commands=['newbatch'])
+    @bot.message_handler(commands=['batch'])
     def start_batch(message):
         if message.from_user.id != ADMIN_USER_ID or message.chat.type != 'private':
             return
